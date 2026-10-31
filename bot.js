@@ -243,10 +243,17 @@ function parse(text) {
 // ---------------- minecraft link ----------------
 let mc = null;
 let mcConn = 0;
+// Minecraft's own encryption for remote websocket links (AES-256-CFB8 over the whole stream)
+const ENCRYPT = process.env.ENCRYPT === '1' || (CLOUD && process.env.ENCRYPT !== '0');
+const SPKI_P384 = Buffer.from('3076301006072a8648ce3d020106052b81040022036200', 'hex');
+function wsSend(ws, str) {
+  if (ws._enc) ws.send(ws._enc.update(Buffer.from(str, 'utf8')), { binary: true });
+  else ws.send(str);
+}
 function raw(cmd) {
-  if (!mc || mc.readyState !== 1) return false;
+  if (!mc || mc.readyState !== 1 || mc._pending) return false;
   try {
-    mc.send(JSON.stringify({
+    wsSend(mc, JSON.stringify({
       header: { version: 1, requestId: crypto.randomUUID(), messagePurpose: 'commandRequest', messageType: 'commandRequest' },
       body: { origin: { type: 'player' }, commandLine: cmd, version: 1 },
     }));
@@ -638,32 +645,85 @@ wsHttp.on('error', (e) => console.error(`[${ts()}] server error:`, e.message || 
 wsHttp.listen(WS_PORT, CLOUD ? '0.0.0.0' : '127.0.0.1');
 const wss = new WebSocketServer({
   server: wsHttp,
-  verifyClient: (info) => !SECRET || String(info.req.url || '').includes(SECRET),
+  verifyClient: (info) => {
+    const ok = !SECRET || String(info.req.url || '').includes(SECRET);
+    if (!ok) console.log(`[${new Date().toLocaleTimeString()}] game connection refused: wrong secret in the address`);
+    return ok;
+  },
 });
-wss.on('connection', (ws) => {
-  if (mc && mc !== ws) { try { mc.close(); } catch (e) { /* ignore */ } }
+function startSession(ws) {
   mc = ws;
   mcConn++;
-  console.log(`[${ts()}] Minecraft connected!`);
+  console.log(`[${ts()}] Minecraft connected!${ws._enc ? ' (encrypted)' : ''}`);
   raw('scriptevent bot:hello {}');
-  ws.send(JSON.stringify({
+  wsSend(ws, JSON.stringify({
     header: { version: 1, requestId: crypto.randomUUID(), messagePurpose: 'subscribe', messageType: 'commandRequest' },
     body: { eventName: 'PlayerMessage' },
   }));
   setTimeout(() => { sendHeartbeat(); pushCfg(true); }, 700);
+}
+function onGameMessage(m) {
+  const b = m && m.body;
+  if (m.header && m.header.eventName === 'PlayerMessage' && b && ['chat', 'say', 'tell'].includes(b.type)) {
+    const t = String(b.message || '');
+    if (t.startsWith('.') && b.sender && b.sender !== 'External') adminCommand(String(b.sender), t);
+  }
+}
+wsHttp.on('upgrade', (req) => console.log(`[${ts()}] connection attempt from the game (${String(req.url || '/').length > 1 ? 'with path' : 'no path'})`));
+wss.on('connection', (ws) => {
+  if (mc && mc !== ws) { try { mc.close(); } catch (e) { /* ignore */ } }
+  ws._pending = false;
+  let started = false;
+  let ecdh = null;
+  let salt = null;
+  let timer = null;
+  const begin = () => { if (started) return; started = true; if (timer) clearTimeout(timer); ws._pending = false; startSession(ws); };
+  if (ENCRYPT) {
+    ws._pending = true;
+    ecdh = crypto.createECDH('secp384r1');
+    ecdh.generateKeys();
+    salt = crypto.randomBytes(16);
+    const spki = Buffer.concat([SPKI_P384, ecdh.getPublicKey()]);
+    mc = ws;
+    ws.send(JSON.stringify({
+      header: { version: 1, requestId: crypto.randomUUID(), messagePurpose: 'commandRequest', messageType: 'commandRequest' },
+      body: { origin: { type: 'player' }, commandLine: `enableencryption "${spki.toString('base64')}" "${salt.toString('base64')}"`, version: 1 },
+    }));
+    timer = setTimeout(() => { console.log(`[${ts()}] no encryption answer from the game, continuing without`); begin(); }, 8000);
+  } else {
+    begin();
+  }
   ws.on('message', (data) => {
+    let text;
+    try {
+      let buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
+      if (ws._dec) buf = ws._dec.update(buf);
+      text = buf.toString('utf8');
+    } catch (e) { return; }
     let m;
-    try { m = JSON.parse(data.toString()); } catch (e) { return; }
-    const b = m && m.body;
-    if (m.header && m.header.eventName === 'PlayerMessage' && b && ['chat', 'say', 'tell'].includes(b.type)) {
-      const t = String(b.message || '');
-      if (t.startsWith('.') && b.sender && b.sender !== 'External') adminCommand(String(b.sender), t);
+    try { m = JSON.parse(text); } catch (e) { return; }
+    if (ws._pending && !started) {
+      const pk = m && m.body && m.body.publicKey;
+      if (pk) {
+        try {
+          const theirs = Buffer.from(pk, 'base64');
+          const point = theirs.subarray(theirs.length - 97);
+          const shared = ecdh.computeSecret(point);
+          const key = crypto.createHash('sha256').update(Buffer.concat([salt, shared])).digest();
+          ws._enc = crypto.createCipheriv('aes-256-cfb8', key, key.subarray(0, 16));
+          ws._dec = crypto.createDecipheriv('aes-256-cfb8', key, key.subarray(0, 16));
+          begin();
+        } catch (e) { console.error(`[${ts()}] encryption setup failed:`, e.message || e); begin(); }
+      }
+      return;
     }
+    onGameMessage(m);
   });
   ws.on('error', (e) => console.error(`[${ts()}] Minecraft socket error:`, e.message || e));
   ws.on('close', (code) => {
+    if (timer) clearTimeout(timer);
     if (mc === ws) mc = null;
-    console.log(`[${ts()}] Minecraft disconnected (code ${code}). Type /wsserver localhost:${WS_PORT} again in the game.`);
+    console.log(`[${ts()}] Minecraft disconnected (code ${code}). Type /wsserver again in the game.`);
   });
 });
 wss.on('error', (e) => console.error(`[${ts()}] websocket server error:`, e.message || e));
