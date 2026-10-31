@@ -1,0 +1,9 @@
+{
+  "name": "tiktok-minecraft-bot",
+  "version": "1.0.0",
+  "private": true,
+  "main": "bot.js",
+  "scripts": { "start": "node bot.js" },
+  "dependencies": { "tiktok-live-connector": "^2.0.0", "ws": "^8.18.0" },
+  "engines": { "node": ">=18" }
+}
